@@ -1,1 +1,17 @@
-./tmp_code
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual env
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+
+/tmp_code
+
+.env
