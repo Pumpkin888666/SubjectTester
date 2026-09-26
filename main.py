@@ -37,7 +37,7 @@ log = create_logger()
 # def main():
 #     # database = dbf("./subject_tester.db")
 #     while True:
-#         print("[bold blue]请输入菜单前面的数字，进行操作：")
+#         print("[bold blue]请输入菜单前面的数字，进行操作:")
 #
 #         menus = {
 #             1: "设置",
@@ -83,8 +83,8 @@ class CoreClass:
         if model is not None:
             self.llm_model = model
         self.log.info("大模型配置填写成功")
-        self.log.info(f"当前模型提供商地址：[yellow bold reverse]{api_url}")
-        self.log.info(f"当前模型：[yellow bold reverse]{'未设置' if model is None else model}")
+        self.log.info(f"当前模型提供商地址:[yellow bold reverse]{api_url}")
+        self.log.info(f"当前模型:[yellow bold reverse]{'未设置' if model is None else model}")
 
     llm_client = None
 
@@ -106,7 +106,11 @@ class CoreClass:
             self.log.error("[red bold reverse]未初始化模型对象就调用llm_get_models方法")
             return None
         self.log.info("正在获取模型列表...")
-        model_data = self.llm_client.models.list()
+        try:
+            model_data = self.llm_client.models.list()
+        except Exception as e:
+            self.log.error(f"[red bold reverse]请求模型列表失败!可能是Api Key配置错误!具体消息: \n {str(e)}]")
+            exit(-1)
         # self.log.info(model_data)
         if show_table:
             table = Table(
@@ -180,17 +184,27 @@ class CoreClass:
     on_chatting = False  # 表示此轮对话是否正在进行 防止同时进行多个对话 tool_call不会使对话停止
     messages = []
 
-    def add_message(self, role, msg, show_log=False):
+    def add_message(self, role, msg, show_log=False,tool_call_id = None):
         allow_roles = ['system', 'user', 'assistant', 'tool']
         if role not in allow_roles:
             self.log.error("[red bold reverse]传递的消息角色不在允许范围内")
             return
-        self.messages.append({
-            'role': role,
-            'content': f"Now's timestamp is  {self.get_time_stamp()}.Pls use user's language when reply user.\n {msg}"
-        })
+        if role == 'tool':
+            if tool_call_id is None:
+                self.log.error("[red bold reverse]传递了tool角色，但未传递tool_call_id!")
+                exit(-1)
+            self.messages.append({
+                'role': role,
+                'content': msg,
+                'tool_call_id':tool_call_id
+            })
+        else:
+            self.messages.append({
+                'role': role,
+                'content': f"Now's timestamp is  {self.get_time_stamp()}.Pls use user's language when reply user.\n {msg}"
+            })
         if show_log:
-            self.log.info(f"消息添加成功:\n|-角色：[blue reverse]{role}[/]\n|-内容：[green reverse]{msg}[/]")
+            self.log.info(f"消息添加成功:\n|-角色:[blue reverse]{role}[/]\n|-内容:[green reverse]{msg}[/]")
 
     def get_time_stamp(self):
         """
@@ -216,7 +230,14 @@ class CoreClass:
         self.has_system_msg = True
         self.log.info("[green reverse bold]系统消息初始化成功")
 
-    def get_response(self, allow_tools_call=False):
+    chat_rounds = 0
+
+    def get_response(self, allow_tool_calls=False):
+        """
+        进行一次Chat Completions API 调用
+        :param allow_tool_calls: 是否允许大模型调用tool_calls
+        :return:
+        """
         if not self.llm_client:
             self.log.error("[red bold reverse]未初始化模型对象时，无法调用get_response方法!")
             return
@@ -230,17 +251,21 @@ class CoreClass:
             self.log.error("[red bold reverse]消息列表为空时，无法调用get_response方法!")
             return
 
+        if self.on_chatting == True:
+            self.log.error("[red bold reverse]当轮对话未完成，无法调用get_response方法!")
+            self.log.error("[red bold reverse]欲强制停止当轮对话，请直接修改on_chatting变量为False")
+            return
+
         self.on_chatting = True
         tools = None
-        if allow_tools_call:
-            self.log.info("正在构建tools对象")
+        if allow_tool_calls:
             tools = []
             for tool_name, tool_cls in self.tools.items():
                 build = {
                     "type": "function",
                     "function": {
                         "name": tool_cls.tool_name,
-                        "description": tool_cls.desc,
+                        "description": tool_cls.tool_desc,
                         "parameters": {
                             "type": "object",
                             "properties": tool_cls.tool_properties,
@@ -249,22 +274,92 @@ class CoreClass:
                     }
                 }
                 tools.append(build)
-                self.log.info(f"[green bold]{tool_name}已构建")
-                self.log.debug(build)
 
-        response = self.llm_client.chat.completions.create(
-            model=self.llm_model,
-            messages=self.messages,
-            max_tokens=1024,
-            temperature=0.7,
-            stream=False,
-            tools=tools,
-        )
+        console.rule(f"[blue]第{self.chat_rounds}轮对话")
+        try:
+            while True:
+                if self.on_chatting == False:
+                    self.log.error(f"[red bold reverse]当轮对话被强制终止")
+                    break
+
+                response = self.llm_client.chat.completions.create(
+                    model=self.llm_model,
+                    messages=self.messages,
+                    max_tokens=1024,
+                    temperature=0.7,
+                    stream=False,
+                    tools=tools,
+                )
+
+                finish_reason = response.choices[0].finish_reason
+                possible_reasons = {
+                    'stop': '模型自然停止生成，或遇到stop序列中列出的字符串。',
+                    'length': '输出长度达到了模型上下文长度限制，或达到了max_tokens的限制。',
+                    'content_filter': '输出内容因触发过滤策略而被过滤。',
+                    'tool_calls': '模型进行了工具调用。',
+                    'insufficient_system_resource': '系统推理资源不足，生成被打断。',
+                    'aborted': '生成过程被中断。'
+                }
+
+                if finish_reason not in possible_reasons:
+                    self.log.error(f"[red bold reverse]云端返回了无法识别的结束原因，本轮对话终止。")
+                    break
+
+                content = response.choices[0].message.content
+                if finish_reason == 'stop':
+                    print(f"[green]{response.model} [/] > \n{content}")
+                    self.add_message('assistant',content)
+                elif finish_reason == 'tool_calls':
+                    if allow_tool_calls:
+                        tool_calls = response.choices[0].message.tool_calls
+                        self.messages.append({
+                            'role': 'assistant',
+                            'content': None,
+                            'tool_calls': tool_calls
+                        })
+                        for tool in tool_calls:
+                            tool_id = tool.id
+                            function = tool.function
+                            print(f"[dim]{response.model}正在调用工具 '{function.name}'")
+                            if function.name not in self.tools.keys():
+                                self.log.error(f"[red bold reverse]模型正在调用工具，但此工具不存在，本轮对话终止!")
+                                break
+                            result = self.tools[function.name].__call__(function.arguments)
+                            self.add_message('tool',result,tool_call_id=tool_id,show_log=False)
+                            print(f"[dim]{response.model}工具 '{function.name}' 已调用成功")
+                    else:
+                        self.log.error(f"[red bold reverse]模型正在调用工具，但当前不允许，本轮对话终止!")
+                        break
+                else:
+                    for r, t in possible_reasons.items():
+                        if finish_reason == r:
+                            print(f"[red bold reverse]{response.model} > {content}")
+
+                if finish_reason != 'tool_calls':
+                    break
+        except Exception as e:
+            self.log.error(f"[red bold reverse]请求模型回复失败!具体消息: \n {str(e)}]")
+            exit(-1)
+
+        self.on_chatting = False
+        console.rule(f"[blue]第{self.chat_rounds}轮对话 [reverse]END")
+        self.chat_rounds += 1
+
 
     def user_talk(self, msg):
         if not self.has_system_msg:
             self.log.error("[red bold reverse]未初始化系统消息时，无法发送用户消息")
             return
+        if self.on_chatting == True:
+            self.log.error("[red bold reverse]当轮对话未完成，无法调用get_response方法!")
+            self.log.error("[red bold reverse]欲强制停止当轮对话，请直接修改on_chatting变量为False")
+            return
+
+        self.add_message('user',msg,show_log=False,tool_call_id=None)
+        # print(f"你 > {msg}")
+        self.get_response(allow_tool_calls=True)
+
+
 
 
 class BaseTool:
@@ -314,7 +409,7 @@ class BaseTool:
         cleaned = {}
         for key, rule in self.tool_properties.items():
             required = rule.get("required", False)
-            expected_type = rule.get("type")
+            expected_type_name = rule.get("type")  # 字符串，如 "string"
             default = rule.get("default")
 
             if key not in arguments:
@@ -325,14 +420,26 @@ class BaseTool:
                 continue
 
             value = arguments[key]
-            if expected_type and not isinstance(value, expected_type):
+
+            # 把 schema 类型名转成 Python 类型
+            JSON_TYPE_MAP = {
+                "string": str,
+                "integer": int,
+                "number": (int, float),  # number 允许 int 或 float
+                "boolean": bool,
+                "object": dict,
+                "array": list,
+                "null": type(None),
+            }
+            expected_type = JSON_TYPE_MAP.get(expected_type_name)
+
+            if expected_type is not None and not isinstance(value, expected_type):
                 raise TypeError(
-                    f"{self.tool_name}: 参数 '{key}' 期望 {expected_type.__name__}，"
+                    f"{self.tool_name}: 参数 '{key}' 期望 {expected_type_name}，"
                     f"实际是 {type(value).__name__}"
                 )
             cleaned[key] = value
 
-        # 可选：拒绝多余参数
         extra = set(arguments) - set(self.tool_properties)
         if extra:
             raise ValueError(f"{self.tool_name}: 未知参数 {extra}")
@@ -343,7 +450,6 @@ class BaseTool:
         arguments = json.loads(arguments_str)
         cleaned = self.validate(arguments)
         return self.execute(**cleaned)
-
 
 if __name__ == "__main__":
     console.print(Panel.fit(
@@ -364,3 +470,11 @@ if __name__ == "__main__":
     else:
         log.warning("[reverse yellow]你没有输入，默认选择第一个模型!")
         core.llm_config_set_model(data[0]['id'])
+    # core.init_system_msg("")
+    # core.inject_tool()
+    # i = 10
+    # while i > 0:
+    #     print(f"[reverse blue]【你还可以提问{i}次】")
+    #     msg = input("你 > ")
+    #     core.user_talk(msg)
+    #     i -= 1
